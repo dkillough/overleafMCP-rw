@@ -224,6 +224,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
+    // Handle tools that don't require project credentials
+    if (name === 'list_projects') {
+      const projectList = Object.entries(projectsConfig.projects || {}).map(([key, project]) =>
+        `• ${key}: ${project.name} (${project.projectId})`
+      );
+      return {
+        content: [{
+          type: 'text',
+          text: `Available Projects:\n\n${projectList.join('\n') || 'No projects configured in projects.json'}`
+        }]
+      };
+    }
+
     // Get project information
     function getProjectConfig(projectName) {
       if (projectName && projectsConfig.projects && projectsConfig.projects[projectName]) {
@@ -235,7 +248,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       throw new Error('No project configuration found. Please set up projects.json with at least a "default" project.');
     }
-    
+
     const projectConfig = getProjectConfig(args.projectName);
     const gitToken = args.gitToken || projectConfig.gitToken;
     const projectId = args.projectId || projectConfig.projectId;
@@ -257,7 +270,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       
       case 'read_file':
-        const content = await client.readFile(args.filePath);
+        const content = await client.readFile(validateFilePath(args.filePath));
         return {
           content: [{
             type: 'text',
@@ -266,7 +279,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       
       case 'get_sections':
-        const sections = await client.getSections(args.filePath);
+        const sections = await client.getSections(validateFilePath(args.filePath));
         const sectionSummary = sections.map((s, i) => 
           `${i + 1}. [${s.type}] ${s.title}\n   Content preview: ${s.content.substring(0, 100).replace(/\s+/g, ' ')}...`
         ).join('\n\n');
@@ -278,7 +291,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       
       case 'get_section_content':
-        const section = await client.getSection(args.filePath, args.sectionTitle);
+        const section = await client.getSection(validateFilePath(args.filePath), args.sectionTitle);
         if (!section) {
           throw new Error(`Section "${args.sectionTitle}" not found`);
         }
@@ -286,17 +299,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: 'text',
             text: `Section: ${section.title}\nType: ${section.type}\nContent length: ${section.content.length} characters\n\n${section.content}`
-          }]
-        };
-      
-      case 'list_projects':
-        const projectList = Object.entries(projectsConfig.projects || {}).map(([key, project]) => 
-          `• ${key}: ${project.name} (${project.projectId})`
-        );
-        return {
-          content: [{
-            type: 'text',
-            text: `Available Projects:\n\n${projectList.join('\n') || 'No projects configured in projects.json'}`
           }]
         };
       
@@ -418,4 +420,7 @@ async function main() {
   await server.connect(transport);
 }
 
-main().catch(() => {});
+main().catch((err) => {
+  process.stderr.write(`Failed to start Overleaf MCP server: ${err.message}\n`);
+  process.exit(1);
+});

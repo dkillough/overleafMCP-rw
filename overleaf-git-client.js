@@ -1,53 +1,98 @@
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
 const { promisify } = require('util');
-const execAsync = promisify(exec);
-
-// Utility function for safe command execution
-function sanitizeCommitMessage(message) {
-    return message
-        .replace(/\\/g, '\\\\')  // Escape backslashes first
-        .replace(/"/g, '\\"')    // Escape quotes
-        .replace(/\n/g, ' ')     // Replace newlines with spaces
-        .replace(/\r/g, '')      // Remove carriage returns
-        .replace(/\$/g, '\\$')   // Escape dollar signs
-        .replace(/`/g, '\\`')    // Escape backticks
-        .trim();
-}
+const execFileAsync = promisify(execFile);
 
 class OverleafGitClient {
     constructor(gitToken, projectId, tempDir = null) {
+        if (!/^[a-zA-Z0-9_-]+$/.test(projectId)) {
+            throw new Error('projectId must be alphanumeric (with hyphens/underscores)');
+        }
+        if (!/^[a-zA-Z0-9_-]+$/.test(gitToken)) {
+            throw new Error('gitToken must be alphanumeric (with hyphens/underscores)');
+        }
         this.gitToken = gitToken;
         this.projectId = projectId;
         // Use OS temp directory if not specified, with absolute path
         this.tempDir = tempDir || path.join(os.tmpdir(), 'overleaf-mcp');
-        // Use git:<TOKEN> format as specified by Overleaf
-        this.repoUrl = `https://git:${gitToken}@git.overleaf.com/${projectId}`;
         this.localPath = path.join(this.tempDir, projectId);
+        this._askPassScript = null;
+    }
+
+    async _createAskPassScript() {
+        if (this._askPassScript) return this._askPassScript;
+        const scriptPath = path.join(this.tempDir, `askpass-${this.projectId}-${crypto.randomUUID()}.sh`);
+        // The script prints the token on stdout when git asks for a password.
+        // Username is always "git" for Overleaf, so we only need to supply the password.
+        await fs.writeFile(scriptPath, `#!/bin/sh\necho '${this.gitToken}'\n`, { mode: 0o700 });
+        this._askPassScript = scriptPath;
+        return scriptPath;
+    }
+
+    async _cleanupAskPassScript() {
+        if (this._askPassScript) {
+            await fs.unlink(this._askPassScript).catch(() => {});
+            this._askPassScript = null;
+        }
+    }
+
+    async _gitEnv() {
+        const askPass = await this._createAskPassScript();
+        return {
+            ...process.env,
+            GIT_TERMINAL_PROMPT: '0',
+            GIT_ASKPASS: askPass,
+            // Overleaf expects username "git", supply via env so the URL stays token-free
+            GIT_USERNAME: 'git',
+        };
+    }
+
+    _redactError(error) {
+        if (this.gitToken && error.message) {
+            error.message = error.message.replaceAll(this.gitToken, '[REDACTED]');
+        }
+        if (error.stderr) {
+            error.stderr = error.stderr.replaceAll(this.gitToken, '[REDACTED]');
+        }
+        if (error.stdout) {
+            error.stdout = error.stdout.replaceAll(this.gitToken, '[REDACTED]');
+        }
+        return error;
     }
 
     async cloneOrPull() {
-        try {
-            // Ensure temp directory exists with proper permissions
-            await fs.mkdir(this.tempDir, { recursive: true, mode: 0o755 });
+        // Ensure temp directory exists with proper permissions
+        await fs.mkdir(this.tempDir, { recursive: true, mode: 0o755 });
+        const env = await this._gitEnv();
 
+        try {
             // Check if repo already exists
+            let exists = false;
             try {
                 await fs.access(this.localPath);
+                exists = true;
+            } catch {}
+
+            if (exists) {
                 // Pull latest changes
-                await execAsync(`cd "${this.localPath}" && git pull`, {
-                    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }
+                await execFileAsync('git', ['pull'], {
+                    cwd: this.localPath,
+                    env
                 });
-            } catch (accessError) {
-                // Clone the repository
-                await execAsync(`git clone "${this.repoUrl}" "${this.localPath}"`, {
-                    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }
+            } else {
+                // Clone with username in URL; password supplied via GIT_ASKPASS
+                const cloneUrl = `https://git@git.overleaf.com/${this.projectId}`;
+                await execFileAsync('git', ['clone', cloneUrl, this.localPath], {
+                    env
                 });
             }
         } catch (error) {
-            throw error;
+            throw this._redactError(error);
+        } finally {
+            await this._cleanupAskPassScript();
         }
     }
 
@@ -140,38 +185,44 @@ class OverleafGitClient {
     }
 
     async commit(message) {
-        const sanitizedMessage = sanitizeCommitMessage(message);
-        const commands = [
-            `cd "${this.localPath}"`,
-            'git add -A',
-            `git commit -m "${sanitizedMessage}"`
-        ];
-
+        const env = await this._gitEnv();
         try {
-            const { stdout } = await execAsync(commands.join(' && '), {
-                env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-                timeout: 30000 // 30 second timeout
+            await execFileAsync('git', ['add', '-A'], {
+                cwd: this.localPath,
+                env,
+                timeout: 30000
+            });
+            const { stdout } = await execFileAsync('git', ['commit', '-m', message], {
+                cwd: this.localPath,
+                env,
+                timeout: 30000
             });
             return stdout || 'Commit successful';
         } catch (error) {
-            if (error.message.includes('nothing to commit')) {
+            const combined = `${error.message || ''} ${error.stdout || ''}`;
+            if (combined.includes('nothing to commit')) {
                 return 'Nothing to commit, working tree clean';
             }
-            if (error.message.includes('timeout')) {
+            if (error.message && error.message.includes('timeout')) {
                 throw new Error('Commit operation timed out');
             }
-            throw new Error(`Commit failed: ${error.message}`);
+            throw new Error(`Commit failed: ${this._redactError(error).message}`);
+        } finally {
+            await this._cleanupAskPassScript();
         }
     }
 
     async push() {
+        const env = await this._gitEnv();
         try {
-            const { stdout } = await execAsync(`cd "${this.localPath}" && git push`, {
-                env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-                timeout: 60000 // 60 second timeout for network operations
+            const { stdout } = await execFileAsync('git', ['push'], {
+                cwd: this.localPath,
+                env,
+                timeout: 60000
             });
             return stdout || 'Push successful';
         } catch (error) {
+            this._redactError(error);
             if (error.message.includes('timeout')) {
                 throw new Error('Push operation timed out - check network connection');
             }
@@ -179,12 +230,15 @@ class OverleafGitClient {
                 throw new Error('Push failed: Authentication error - check git token');
             }
             throw new Error(`Push failed: ${error.message}`);
+        } finally {
+            await this._cleanupAskPassScript();
         }
     }
 
     async status() {
         await this.cloneOrPull();
-        const { stdout } = await execAsync(`cd "${this.localPath}" && git status`, {
+        const { stdout } = await execFileAsync('git', ['status'], {
+            cwd: this.localPath,
             env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }
         });
         return stdout;
